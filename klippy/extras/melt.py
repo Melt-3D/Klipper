@@ -3,9 +3,100 @@
 # Copyright (C) 2025-2026  Juraj Minaric <>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
+#
+# Adds the V and W gcode axes. They are offsets of stepper_z1 and
+# stepper_z2 from stepper_z, so "G1 Z.." moves all three Z motors
+# together and "G1 V.. W.." moves stepper_z1 / stepper_z2 on their own.
+#
+# While both offsets are zero the Z motors are "synced" (stock Klipper
+# behaviour on the toolhead trapq).  The first move that changes V or W
+# switches stepper_z1 and stepper_z2 to their own trapq, which gets the
+# combined Z + offset motion of every move ("independent" mode).
 import math, logging
-from . import force_move
 import chelper
+
+class ZOffsetAxis:
+    def __init__(self, melt, config, gcode_id, stepper_name):
+        self.melt = melt
+        self.printer = config.get_printer()
+        self.gcode_id = gcode_id
+        self.stepper_name = stepper_name
+        self.stepper = None
+        self.synced_sk = None
+        self.offset_min = config.getfloat(gcode_id.lower() + '_min', None)
+        self.offset_max = config.getfloat(gcode_id.lower() + '_max', None)
+        self.instant_corner_v = config.getfloat(
+            'instantaneous_corner_velocity', 1., minval=0.)
+        # Request check_move/process_move calls for Z only moves too
+        self.follows_z = True
+        # Setup iterative solver
+        ffi_main, ffi_lib = chelper.get_ffi()
+        self.trapq = ffi_main.gc(ffi_lib.trapq_alloc(), ffi_lib.trapq_free)
+        self.trapq_append = ffi_lib.trapq_append
+        self.trapq_set_position = ffi_lib.trapq_set_position
+        self.stepper_kinematics = ffi_main.gc(
+            ffi_lib.cartesian_stepper_alloc(b'x'), ffi_lib.free)
+    def get_index(self):
+        toolhead = self.printer.lookup_object('toolhead')
+        return toolhead.get_extra_axes().index(self)
+    # Mode switching (toolhead must be flushed by the caller)
+    def enter_independent(self, height, print_time):
+        self.synced_sk = self.stepper.set_stepper_kinematics(
+            self.stepper_kinematics)
+        self.stepper.set_position([height, 0., 0.])
+        self.stepper.set_trapq(self.trapq)
+        self.trapq_set_position(self.trapq, print_time, height, 0., 0.)
+    def enter_synced(self, toolhead_pos):
+        toolhead = self.printer.lookup_object('toolhead')
+        self.stepper.set_stepper_kinematics(self.synced_sk)
+        self.stepper.set_trapq(toolhead.get_trapq())
+        self.stepper.set_position(toolhead_pos[:3])
+        self.synced_sk = None
+    def set_height(self, height, print_time):
+        self.stepper.set_position([height, 0., 0.])
+        self.trapq_set_position(self.trapq, print_time, height, 0., 0.)
+    # Toolhead extra axis interface
+    def get_axis_gcode_id(self):
+        return self.gcode_id
+    def get_trapq(self):
+        return self.trapq
+    def check_move(self, move, ea_index):
+        melt = self.melt
+        if not move.axes_d[ea_index] and not melt.independent:
+            # Z only move while synced - kinematics already checked it
+            return
+        offset = move.end_pos[ea_index]
+        if ((self.offset_min is not None and offset < self.offset_min)
+            or (self.offset_max is not None and offset > self.offset_max)):
+            raise move.move_error("%s offset out of range" % (self.gcode_id,))
+        # Offsets may be changed with Z unhomed (to recover from a
+        # failed G28), the absolute height is only known once homed
+        height = move.end_pos[2] + offset
+        if melt.is_z_homed() and (height < melt.z_min or height > melt.z_max):
+            raise move.move_error("%s out of range" % (self.stepper_name,))
+        # Limit to Z velocity/accel using the combined motor travel
+        dist = move.axes_d[2] + move.axes_d[ea_index]
+        if dist:
+            ratio = move.move_d / abs(dist)
+            move.limit_speed(melt.max_z_velocity * ratio,
+                             melt.max_z_accel * ratio)
+        if move.axes_d[ea_index]:
+            melt.set_independent()
+    def calc_junction(self, prev_move, move, ea_index):
+        diff_r = move.axes_r[ea_index] - prev_move.axes_r[ea_index]
+        if diff_r:
+            return (self.instant_corner_v / abs(diff_r))**2
+        return move.max_cruise_v2
+    def process_move(self, print_time, move, ea_index):
+        if not self.melt.independent:
+            return
+        start_pos = move.start_pos[2] + move.start_pos[ea_index]
+        axis_r = move.axes_r[2] + move.axes_r[ea_index]
+        self.trapq_append(self.trapq, print_time,
+                          move.accel_t, move.cruise_t, move.decel_t,
+                          start_pos, 0., 0.,
+                          axis_r, 0., 0.,
+                          move.start_v, move.cruise_v, move.accel)
 
 class Melt:
     def __init__(self, config):
@@ -14,26 +105,27 @@ class Melt:
 
         self.a_angle = 0.0
         self.b_angle = 0.0
-        self.a_offset = 0.0
-        self.b_offset = 0.0
-        self.length = 250.95
-        self.width = 285.9
+        self.length = config.getfloat('length', 250.95, above=0.)
+        self.width = config.getfloat('width', 285.9, above=0.)
         self.eject_coords = {"X": 0.0, "Y": 200.0, "Z": 10.0}
 
-        self.z_offset = 0.0
-        self.v_offset = 0.0
-
-        # Setup iterative solver
-        ffi_main, ffi_lib = chelper.get_ffi()
-        self.trapq = ffi_main.gc(ffi_lib.trapq_alloc(), ffi_lib.trapq_free)
-        self.trapq_append = ffi_lib.trapq_append
-        self.trapq_finalize_moves = ffi_lib.trapq_finalize_moves
-        self.stepper_kinematics = ffi_main.gc(
-            ffi_lib.cartesian_stepper_alloc(b'x'), ffi_lib.free)
+        # V/W axes
+        self.independent = False
+        self.z_min = self.z_max = 0.
+        self.max_z_velocity = self.max_z_accel = 0.
+        self.axes = [ZOffsetAxis(self, config, 'V', 'stepper_z1'),
+                     ZOffsetAxis(self, config, 'W', 'stepper_z2')]
+        self.printer.register_event_handler("klippy:connect",
+                                            self._handle_connect)
+        self.printer.register_event_handler("toolhead:set_position",
+                                            self._handle_set_position)
+        self.printer.register_event_handler("homing:home_rails_begin",
+                                            self._handle_home_rails_begin)
+        self.printer.register_event_handler("homing:homing_move_begin",
+                                            self._handle_homing_move_begin)
         # Register commands
         gcode = self.printer.lookup_object('gcode')
 
-        gcode.register_command('G13', self.cmd_G13, desc=self.cmd_G13_help)
         gcode.register_command('GET_OFFSET', self.cmd_GET_OFFSET, desc=self.cmd_GET_OFFSET_help)
         gcode.register_command('G14', self.cmd_G14, desc=self.cmd_G14_help)
         gcode.register_command('GET_ANGLE', self.cmd_GET_ANGLE, desc=self.cmd_GET_ANGLE_help)
@@ -45,42 +137,75 @@ class Melt:
             raise self.printer.config_error("Unknown stepper %s" % (name,))
         return self.steppers[name]
 
-    def invert_dir(self, s):
-        s.set_dir_inverted(not bool(s.get_dir_inverted()[0]))
-
-    cmd_G13_help = "(Relative) Separate movement of the Z axis steppers"
-    def cmd_G13(self, gcmd):
-        dis_z = gcmd.get_float('Z')
-        dis_v = gcmd.get_float('V')
-
-        speed = 40
-
+    def _handle_connect(self):
         toolhead = self.printer.lookup_object('toolhead')
-        curpos = toolhead.get_position()
-        prev_z = curpos[2]
-        kin = self.printer.lookup_object('toolhead').get_kinematics()
-        z_steppers = [s for s in kin.get_steppers() if
-                        s.is_active_axis('z')]
+        kin = toolhead.get_kinematics()
+        status = kin.get_status(None)
+        self.z_min = status['axis_minimum'][2]
+        self.z_max = status['axis_maximum'][2]
+        max_velocity, max_accel = toolhead.get_max_velocity()
+        self.max_z_velocity = getattr(kin, 'max_z_velocity', max_velocity)
+        self.max_z_accel = getattr(kin, 'max_z_accel', max_accel)
+        for axis in self.axes:
+            axis.stepper = self.lookup_stepper(axis.stepper_name)
+            toolhead.add_extra_axis(axis, 0.)
+    def is_z_homed(self):
+        toolhead = self.printer.lookup_object('toolhead')
+        eventtime = self.printer.get_reactor().monotonic()
+        return 'z' in toolhead.get_kinematics().get_status(
+            eventtime)['homed_axes']
+    def get_offsets(self):
+        pos = self.printer.lookup_object('toolhead').get_position()
+        return [pos[axis.get_index()] for axis in self.axes]
+    def set_independent(self):
+        if self.independent:
+            return
+        toolhead = self.printer.lookup_object('toolhead')
+        toolhead.flush_step_generation()
+        pos = toolhead.get_position()
+        print_time = toolhead.get_last_move_time()
+        for axis in self.axes:
+            axis.enter_independent(pos[2] + pos[axis.get_index()], print_time)
+        self.independent = True
+        logging.info("melt: Z motors switched to independent mode")
+    def set_synced(self, reason):
+        if not self.independent:
+            return
+        if any(abs(o) > 0.000001 for o in self.get_offsets()):
+            raise self.printer.command_error(
+                "Move V and W back to 0 before %s" % (reason,))
+        toolhead = self.printer.lookup_object('toolhead')
+        toolhead.flush_step_generation()
+        pos = toolhead.get_position()
+        for axis in self.axes:
+            axis.enter_synced(pos)
+        self.independent = False
+        logging.info("melt: Z motors switched to synced mode")
+    def _handle_set_position(self):
+        # Toolhead Z was re-anchored - keep the offsets on top of it
+        if not self.independent:
+            return
+        toolhead = self.printer.lookup_object('toolhead')
+        pos = toolhead.get_position()
+        print_time = toolhead.get_last_move_time()
+        for axis in self.axes:
+            axis.set_height(pos[2] + pos[axis.get_index()], print_time)
+    def _handle_home_rails_begin(self, homing_state, rails):
+        if 2 in homing_state.get_axes():
+            self.set_synced("homing Z")
+    def _handle_homing_move_begin(self, hmove):
+        z_steppers = [axis.stepper for axis in self.axes]
+        for mcu_endstop in hmove.get_mcu_endstops():
+            if any(s in z_steppers for s in mcu_endstop.get_steppers()):
+                self.set_synced("probing")
+                return
 
-        toolhead.wait_moves()
-        self.invert_dir(z_steppers[0])
-        curpos[2] += dis_v - self.v_offset
-        toolhead.move(curpos, speed)
-        toolhead.wait_moves()
-        self.invert_dir(z_steppers[0])
-        toolhead.wait_moves()
-
-        curpos[2] = prev_z + dis_z - self.z_offset
-        self.v_offset = dis_v
-        self.z_offset = dis_z
-        toolhead.set_position(curpos)
-        toolhead.wait_moves()
-
-    cmd_GET_OFFSET_help = "Get current offset"
+    cmd_GET_OFFSET_help = "Get current V and W offset"
     def cmd_GET_OFFSET(self, gcmd):
-        gcode = self.printer.lookup_object('gcode')
-        msg = f"Z offset: {str(self.z_offset)}, V offset: {str(self.v_offset)}"
-        gcode.respond_info(str(msg))
+        v_offset, w_offset = self.get_offsets()
+        mode = "independent" if self.independent else "synced"
+        gcmd.respond_info("V offset: %.4f, W offset: %.4f (%s)"
+                          % (v_offset, w_offset, mode))
 
     def _check_collision(self, angle, length, width):
         toolhead = self.printer.lookup_object('toolhead')
@@ -92,52 +217,34 @@ class Melt:
         if 0 > y_line:
             raise self.printer.command_error("Prevented collision on A angle")
 
-    # Tu nastane podla mna nejaka sracka ked sa pocita offset zase ked nie je angle 0
+    def _angle_offsets(self, a_angle, b_angle):
+        a_offset = math.tan(math.radians(a_angle)) * self.length / 2
+        b_offset = math.tan(math.radians(b_angle)) * self.width / 2
+        return a_offset, b_offset
+
     def angle_move(self, new_a_angle, new_b_angle, speed):
+        # A tilt: stepper_z -a, stepper_z1 and stepper_z2 +a
+        # B tilt: stepper_z1 -b, stepper_z2 +b
         toolhead = self.printer.lookup_object('toolhead')
+        gcode_move = self.printer.lookup_object('gcode_move')
+        a_offset, b_offset = self._angle_offsets(self.a_angle, self.b_angle)
+        new_a_offset, new_b_offset = self._angle_offsets(new_a_angle,
+                                                         new_b_angle)
+        da = new_a_offset - a_offset
+        db = new_b_offset - b_offset
+        v_axis, w_axis = self.axes
+
         curpos = toolhead.get_position()
-        prev_pos = toolhead.get_position()
-        kin = self.printer.lookup_object('toolhead').get_kinematics()
-        z_steppers = [s for s in kin.get_steppers() if
-                s.is_active_axis('z')]
-        change_a = False
-        change_b = False
+        curpos[2] -= da
+        curpos[v_axis.get_index()] += 2 * da - db
+        curpos[w_axis.get_index()] += 2 * da + db
+        toolhead.move(curpos, speed)
 
-        toolhead.flush_step_generation()
-        if new_a_angle != self.a_angle:
-            change_a = True
-            rad = math.radians(new_a_angle)
-            za_offset = (math.tan(rad) * self.length) / 2
-
-            self.invert_dir(z_steppers[1])
-            self.invert_dir(z_steppers[2])
-            curpos[2] -= za_offset - self.a_offset
-            toolhead.move(curpos, speed)
-            toolhead.flush_step_generation()
-            self.invert_dir(z_steppers[1])
-            self.invert_dir(z_steppers[2])
-
-        if new_b_angle != self.b_angle:
-            change_b = True
-            rad = math.radians(new_b_angle)
-            zb_offset = (math.tan(rad) * self.width) / 2
-
-            z_steppers[0].set_trapq(None)
-            self.invert_dir(z_steppers[2])
-            curpos[2] -= zb_offset - self.b_offset
-            toolhead.move(curpos, speed)
-            toolhead.flush_step_generation()
-            self.invert_dir(z_steppers[2])
-            z_steppers[0].set_trapq(toolhead.get_trapq())
-
-        if change_a:
-            self.a_angle = new_a_angle
-            self.a_offset = za_offset
-        if change_b:
-            self.b_angle = new_b_angle
-            self.b_offset = zb_offset
-
-        toolhead.set_position(prev_pos)
+        self.a_angle = new_a_angle
+        self.b_angle = new_b_angle
+        # stepper_z was lowered by da - keep the gcode Z position unchanged
+        gcode_move.base_position[2] -= da
+        gcode_move.reset_last_position()
 
     cmd_G14_help = "Separate movement of the Z axis steppers with \
                     angle as input"
@@ -172,9 +279,10 @@ class Melt:
     cmd_GET_ANGLE_help = "Get current angle"
     def cmd_GET_ANGLE(self, gcmd):
         gcode = self.printer.lookup_object('gcode')
+        a_offset, b_offset = self._angle_offsets(self.a_angle, self.b_angle)
         msg = f"A angle: {str(self.a_angle)}, B angle: {str(self.b_angle)}"
         gcode.respond_info(str(msg))
-        msg = f"A offset: {str(self.a_offset)}, B offset: {str(self.b_offset)}"
+        msg = f"A offset: {str(a_offset)}, B offset: {str(b_offset)}"
         gcode.respond_info(str(msg))
 
     cmd_G15_help = "Automatically removes print from print bed"
@@ -248,8 +356,8 @@ class Melt:
 
             toolhead.move(curpos, 80)
 
-            self.angle_move(30, 0, 20, False)
-            self.angle_move(0, 0, 20, False)
+            self.angle_move(30, 0, 20)
+            self.angle_move(0, 0, 20)
 
 def load_config(config):
     return Melt(config)
