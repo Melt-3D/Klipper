@@ -334,6 +334,10 @@ class ToolHead:
             self.print_time = min_print_time
             self.printer.send_event("toolhead:sync_print_time",
                                     curtime, est_print_time, self.print_time)
+    def _extra_axis_active(self, move, ea_index, ea):
+        # Extra axes with follows_z set also need Z only moves
+        return move.axes_d[ea_index] or (move.axes_d[2]
+                                         and getattr(ea, 'follows_z', False))
     def _process_lookahead(self, lazy=False):
         moves = self.lookahead.flush(lazy=lazy)
         if not moves:
@@ -355,7 +359,7 @@ class ToolHead:
                     move.axes_r[0], move.axes_r[1], move.axes_r[2],
                     move.start_v, move.cruise_v, move.accel)
             for e_index, ea in enumerate(self.extra_axes):
-                if move.axes_d[e_index + 3]:
+                if self._extra_axis_active(move, e_index + 3, ea):
                     ea.process_move(next_move_time, move, e_index + 3)
             next_move_time = (next_move_time + move.accel_t
                               + move.cruise_t + move.decel_t)
@@ -477,7 +481,7 @@ class ToolHead:
         if move.is_kinematic_move:
             self.kin.check_move(move)
         for e_index, ea in enumerate(self.extra_axes):
-            if move.axes_d[e_index + 3]:
+            if self._extra_axis_active(move, e_index + 3, ea):
                 ea.check_move(move, e_index + 3)
         self.commanded_pos[:] = move.end_pos
         want_flush = self.lookahead.add_move(move)
