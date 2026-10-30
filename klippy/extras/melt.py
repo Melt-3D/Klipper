@@ -62,6 +62,7 @@ class ZOffsetAxis:
         return self.trapq
     def check_move(self, move, ea_index):
         melt = self.melt
+        melt.check_z_lock(move)
         if not move.axes_d[ea_index] and not melt.independent:
             # Z only move while synced - kinematics already checked it
             return
@@ -72,7 +73,8 @@ class ZOffsetAxis:
         # Offsets may be changed with Z unhomed (to recover from a
         # failed G28), the absolute height is only known once homed
         height = move.end_pos[2] + offset
-        if melt.is_z_homed() and (height < melt.z_min or height > melt.z_max):
+        if melt.is_z_homed() and (height < melt.unlocked_z_min
+                                  or height > melt.z_max):
             raise move.move_error("%s out of range" % (self.stepper_name,))
         # Limit to Z velocity/accel using the combined motor travel
         dist = move.axes_d[2] + move.axes_d[ea_index]
@@ -112,6 +114,9 @@ class Melt:
         # V/W axes
         self.independent = False
         self.z_min = self.z_max = 0.
+        # Z below [stepper_z] position_min (down to unlocked_z_min) is
+        # only allowed while V or W is non-zero
+        self.unlocked_z_min = config.getfloat('unlocked_z_min', None)
         self.max_z_velocity = self.max_z_accel = 0.
         self.axes = [ZOffsetAxis(self, config, 'V', 'stepper_z1'),
                      ZOffsetAxis(self, config, 'W', 'stepper_z2')]
@@ -142,6 +147,12 @@ class Melt:
         kin = toolhead.get_kinematics()
         status = kin.get_status(None)
         self.z_min = status['axis_minimum'][2]
+        if self.unlocked_z_min is None:
+            self.unlocked_z_min = self.z_min
+        elif self.unlocked_z_min > self.z_min:
+            raise self.printer.config_error(
+                "unlocked_z_min in section 'melt' must be at most"
+                " [stepper_z] position_min")
         self.z_max = status['axis_maximum'][2]
         max_velocity, max_accel = toolhead.get_max_velocity()
         self.max_z_velocity = getattr(kin, 'max_z_velocity', max_velocity)
@@ -157,6 +168,15 @@ class Melt:
     def get_offsets(self):
         pos = self.printer.lookup_object('toolhead').get_position()
         return [pos[axis.get_index()] for axis in self.axes]
+    def check_z_lock(self, move):
+        if move.end_pos[2] >= self.z_min:
+            return
+        if any(abs(move.end_pos[axis.get_index()]) > 0.000001
+               for axis in self.axes):
+            return
+        if move.axes_d[2] or self.is_z_homed():
+            raise move.move_error(
+                "Z below %.3f needs a V or W offset" % (self.z_min,))
     def set_independent(self):
         if self.independent:
             return
@@ -182,6 +202,12 @@ class Melt:
         self.independent = False
         logging.info("melt: Z motors switched to synced mode")
     def _handle_set_position(self):
+        # Homing resets the kinematic Z range to [stepper_z] - extend it
+        # down to unlocked_z_min, check_z_lock() enforces position_min
+        kin = self.printer.lookup_object('toolhead').get_kinematics()
+        z_min, z_max = kin.limits[2]
+        if z_min <= z_max:
+            kin.limits[2] = (min(z_min, self.unlocked_z_min), z_max)
         # Toolhead Z was re-anchored - keep the offsets on top of it
         if not self.independent:
             return
@@ -204,8 +230,12 @@ class Melt:
     def cmd_GET_OFFSET(self, gcmd):
         v_offset, w_offset = self.get_offsets()
         mode = "independent" if self.independent else "synced"
-        gcmd.respond_info("V offset: %.4f, W offset: %.4f (%s)"
-                          % (v_offset, w_offset, mode))
+        if abs(v_offset) > 0.000001 or abs(w_offset) > 0.000001:
+            z_min = self.unlocked_z_min
+        else:
+            z_min = self.z_min
+        gcmd.respond_info("V offset: %.4f, W offset: %.4f (%s), Z min: %.3f"
+                          % (v_offset, w_offset, mode, z_min))
 
     def _check_collision(self, angle, length, width):
         toolhead = self.printer.lookup_object('toolhead')
