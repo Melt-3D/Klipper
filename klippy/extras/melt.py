@@ -7,6 +7,9 @@ import math, logging
 from . import force_move, homing
 import chelper
 
+Z_MAX_HOMING_CURRENT = 0.4
+Z_MAX_RETRACT_DIST = 20.
+
 TMC_DRIVERS = ['tmc2209', 'tmc2130', 'tmc2208', 'tmc2240', 'tmc2660',
                'tmc5160']
 
@@ -295,7 +298,7 @@ class Melt:
                 "SET_TMC_CURRENT STEPPER=%s CURRENT=%.3f" % (name, cur))
 
     cmd_HOME_ZMAX_help = "Home each Z stepper to max independently using " \
-                        "sensorless homing [CURRENT=<amps>]"
+                        "sensorless homing [CURRENT=<amps>] [RETRACT=<mm>]"
     def cmd_HOME_ZMAX(self, gcmd):
         if self.z_max_errors:
             raise gcmd.error("HOME_ZMAX unavailable: %s"
@@ -307,14 +310,16 @@ class Melt:
         z_rail = kin.rails[2]
         z_min, z_max = z_rail.get_range()
         speed = z_rail.get_homing_info().speed
-        # Optional reduced run current during the homing move
-        homing_current = gcmd.get_float('CURRENT', None, above=0.)
+        # Reduced run current during the homing move
+        homing_current = gcmd.get_float('CURRENT', Z_MAX_HOMING_CURRENT,
+                                        above=0.)
+        retract_dist = gcmd.get_float('RETRACT', Z_MAX_RETRACT_DIST, minval=0.,
+                                      maxval=z_max - z_min)
         prev_currents = {}
-        if homing_current is not None:
-            for name, tmc_name in self.z_tmc_names.items():
-                tmc = self.printer.lookup_object(tmc_name)
-                prev_currents[name] = tmc.get_status()['run_current']
-            self._set_z_currents({n: homing_current for n in prev_currents})
+        for name, tmc_name in self.z_tmc_names.items():
+            tmc = self.printer.lookup_object(tmc_name)
+            prev_currents[name] = tmc.get_status()['run_current']
+        self._set_z_currents({n: homing_current for n in prev_currents})
         # Pretend Z is at its minimum so a move to max covers full travel
         toolhead.flush_step_generation()
         pos = toolhead.get_position()
@@ -326,12 +331,18 @@ class Melt:
         # and the move ends once every endstop has triggered
         hmove = homing.HomingMove(self.printer, self.z_max_endstops)
         try:
-            hmove.homing_move(movepos, speed)
+            try:
+                hmove.homing_move(movepos, speed)
+            finally:
+                self._set_z_currents(prev_currents)
+            # Back off from the top stops at normal current
+            if retract_dist:
+                movepos[2] -= retract_dist
+                toolhead.move(movepos, speed)
+                toolhead.wait_moves()
         finally:
             # Position is not known relative to the bed, require G28 Z
             kin.clear_homing_state("z")
-            if prev_currents:
-                self._set_z_currents(prev_currents)
         # Bed is now flat against the top stops
         self.a_angle = self.b_angle = 0.0
         self.a_offset = self.b_offset = 0.0
