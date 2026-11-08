@@ -4,13 +4,19 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import math, logging
-from . import force_move
+from . import force_move, homing
 import chelper
+
+TMC_DRIVERS = ['tmc2209', 'tmc2130', 'tmc2208', 'tmc2240', 'tmc2660',
+               'tmc5160']
 
 class Melt:
     def __init__(self, config):
         self.printer = config.get_printer()
         self.steppers = {}
+        # Per-stepper sensorless endstops used by G28_ZMAX
+        self.z_max_endstops = []
+        self.z_max_errors = []
 
         self.a_angle = 0.0
         self.b_angle = 0.0
@@ -38,8 +44,36 @@ class Melt:
         gcode.register_command('G14', self.cmd_G14, desc=self.cmd_G14_help)
         gcode.register_command('GET_ANGLE', self.cmd_GET_ANGLE, desc=self.cmd_GET_ANGLE_help)
         gcode.register_command('G15', self.cmd_G15, desc=self.cmd_G15_help)
+        gcode.register_command('G28_ZMAX', self.cmd_G28_ZMAX,
+                               desc=self.cmd_G28_ZMAX_help)
     def register_stepper(self, config, mcu_stepper):
-        self.steppers[mcu_stepper.get_name()] = mcu_stepper
+        name = mcu_stepper.get_name()
+        self.steppers[name] = mcu_stepper
+        if name.startswith('stepper_z'):
+            self._setup_z_max_endstop(config, mcu_stepper)
+    def _setup_z_max_endstop(self, config, mcu_stepper):
+        # Give each Z stepper its own TMC virtual endstop so that during
+        # G28_ZMAX every motor stops only on its own stall
+        name = mcu_stepper.get_name()
+        driver = None
+        for d in TMC_DRIVERS:
+            if config.has_section('%s %s' % (d, name)):
+                driver = d
+                break
+        if driver is None:
+            self.z_max_errors.append("%s: no tmc driver section" % (name,))
+            return
+        tmc_config = config.getsection('%s %s' % (driver, name))
+        if not any(tmc_config.get(opt, None) is not None
+                   for opt in ['diag_pin', 'diag0_pin', 'diag1_pin']):
+            self.z_max_errors.append("%s: missing diag_pin in [%s %s]"
+                                     % (name, driver, name))
+            return
+        ppins = self.printer.lookup_object('pins')
+        mcu_endstop = ppins.setup_pin(
+            'endstop', '%s_%s:virtual_endstop' % (driver, name))
+        mcu_endstop.add_stepper(mcu_stepper)
+        self.z_max_endstops.append((mcu_endstop, name))
     def lookup_stepper(self, name):
         if name not in self.steppers:
             raise self.printer.config_error("Unknown stepper %s" % (name,))
@@ -250,6 +284,39 @@ class Melt:
 
             self.angle_move(30, 0, 20, False)
             self.angle_move(0, 0, 20, False)
+
+    cmd_G28_ZMAX_help = "Home each Z stepper to max independently using " \
+                        "sensorless homing"
+    def cmd_G28_ZMAX(self, gcmd):
+        if self.z_max_errors:
+            raise gcmd.error("G28_ZMAX unavailable: %s"
+                             % ("; ".join(self.z_max_errors),))
+        if not self.z_max_endstops:
+            raise gcmd.error("G28_ZMAX unavailable: no Z steppers found")
+        toolhead = self.printer.lookup_object('toolhead')
+        kin = toolhead.get_kinematics()
+        z_rail = kin.rails[2]
+        z_min, z_max = z_rail.get_range()
+        speed = z_rail.get_homing_info().speed
+        # Pretend Z is at its minimum so a move to max covers full travel
+        toolhead.flush_step_generation()
+        pos = toolhead.get_position()
+        pos[2] = z_min
+        toolhead.set_position(pos, homing_axes="z")
+        movepos = list(pos)
+        movepos[2] = z_max
+        # All endstops start together; each one halts only its own stepper
+        # and the move ends once every endstop has triggered
+        hmove = homing.HomingMove(self.printer, self.z_max_endstops)
+        try:
+            hmove.homing_move(movepos, speed)
+        finally:
+            # Position is not known relative to the bed, require G28 Z
+            kin.clear_homing_state("z")
+        # Bed is now flat against the top stops
+        self.a_angle = self.b_angle = 0.0
+        self.a_offset = self.b_offset = 0.0
+        self.z_offset = self.v_offset = 0.0
 
 def load_config(config):
     return Melt(config)
