@@ -16,6 +16,7 @@ class Melt:
         self.steppers = {}
         # Per-stepper sensorless endstops used by G28_ZMAX
         self.z_max_endstops = []
+        self.z_tmc_names = {}
         self.z_max_errors = []
 
         self.a_angle = 0.0
@@ -74,6 +75,7 @@ class Melt:
             'endstop', '%s_%s:virtual_endstop' % (driver, name))
         mcu_endstop.add_stepper(mcu_stepper)
         self.z_max_endstops.append((mcu_endstop, name))
+        self.z_tmc_names[name] = '%s %s' % (driver, name)
     def lookup_stepper(self, name):
         if name not in self.steppers:
             raise self.printer.config_error("Unknown stepper %s" % (name,))
@@ -285,8 +287,15 @@ class Melt:
             self.angle_move(30, 0, 20, False)
             self.angle_move(0, 0, 20, False)
 
+    def _set_z_currents(self, currents):
+        # currents: {stepper_name: run_current}
+        gcode = self.printer.lookup_object('gcode')
+        for name, cur in currents.items():
+            gcode.run_script_from_command(
+                "SET_TMC_CURRENT STEPPER=%s CURRENT=%.3f" % (name, cur))
+
     cmd_G28_ZMAX_help = "Home each Z stepper to max independently using " \
-                        "sensorless homing"
+                        "sensorless homing [CURRENT=<amps>]"
     def cmd_G28_ZMAX(self, gcmd):
         if self.z_max_errors:
             raise gcmd.error("G28_ZMAX unavailable: %s"
@@ -298,6 +307,14 @@ class Melt:
         z_rail = kin.rails[2]
         z_min, z_max = z_rail.get_range()
         speed = z_rail.get_homing_info().speed
+        # Optional reduced run current during the homing move
+        homing_current = gcmd.get_float('CURRENT', None, above=0.)
+        prev_currents = {}
+        if homing_current is not None:
+            for name, tmc_name in self.z_tmc_names.items():
+                tmc = self.printer.lookup_object(tmc_name)
+                prev_currents[name] = tmc.get_status()['run_current']
+            self._set_z_currents({n: homing_current for n in prev_currents})
         # Pretend Z is at its minimum so a move to max covers full travel
         toolhead.flush_step_generation()
         pos = toolhead.get_position()
@@ -313,6 +330,8 @@ class Melt:
         finally:
             # Position is not known relative to the bed, require G28 Z
             kin.clear_homing_state("z")
+            if prev_currents:
+                self._set_z_currents(prev_currents)
         # Bed is now flat against the top stops
         self.a_angle = self.b_angle = 0.0
         self.a_offset = self.b_offset = 0.0
