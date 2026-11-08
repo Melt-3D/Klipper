@@ -14,7 +14,7 @@ class Melt:
     def __init__(self, config):
         self.printer = config.get_printer()
         self.steppers = {}
-        # Per-stepper sensorless endstops used by G28_ZMAX
+        # Per-stepper sensorless endstops used by HOME_ZMAX
         self.z_max_endstops = []
         self.z_tmc_names = {}
         self.z_max_errors = []
@@ -45,8 +45,8 @@ class Melt:
         gcode.register_command('G14', self.cmd_G14, desc=self.cmd_G14_help)
         gcode.register_command('GET_ANGLE', self.cmd_GET_ANGLE, desc=self.cmd_GET_ANGLE_help)
         gcode.register_command('G15', self.cmd_G15, desc=self.cmd_G15_help)
-        gcode.register_command('G28_ZMAX', self.cmd_G28_ZMAX,
-                               desc=self.cmd_G28_ZMAX_help)
+        gcode.register_command('HOME_ZMAX', self.cmd_HOME_ZMAX,
+                               desc=self.cmd_HOME_ZMAX_help)
     def register_stepper(self, config, mcu_stepper):
         name = mcu_stepper.get_name()
         self.steppers[name] = mcu_stepper
@@ -54,7 +54,7 @@ class Melt:
             self._setup_z_max_endstop(config, mcu_stepper)
     def _setup_z_max_endstop(self, config, mcu_stepper):
         # Give each Z stepper its own TMC virtual endstop so that during
-        # G28_ZMAX every motor stops only on its own stall
+        # HOME_ZMAX every motor stops only on its own stall
         name = mcu_stepper.get_name()
         driver = None
         for d in TMC_DRIVERS:
@@ -294,14 +294,14 @@ class Melt:
             gcode.run_script_from_command(
                 "SET_TMC_CURRENT STEPPER=%s CURRENT=%.3f" % (name, cur))
 
-    cmd_G28_ZMAX_help = "Home each Z stepper to max independently using " \
+    cmd_HOME_ZMAX_help = "Home each Z stepper to max independently using " \
                         "sensorless homing [CURRENT=<amps>]"
-    def cmd_G28_ZMAX(self, gcmd):
+    def cmd_HOME_ZMAX(self, gcmd):
         if self.z_max_errors:
-            raise gcmd.error("G28_ZMAX unavailable: %s"
+            raise gcmd.error("HOME_ZMAX unavailable: %s"
                              % ("; ".join(self.z_max_errors),))
         if not self.z_max_endstops:
-            raise gcmd.error("G28_ZMAX unavailable: no Z steppers found")
+            raise gcmd.error("HOME_ZMAX unavailable: no Z steppers found")
         toolhead = self.printer.lookup_object('toolhead')
         kin = toolhead.get_kinematics()
         z_rail = kin.rails[2]
