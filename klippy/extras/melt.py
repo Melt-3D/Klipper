@@ -123,6 +123,7 @@ class Melt:
         gcode.register_command('G15', self.cmd_G15, desc=self.cmd_G15_help)
         gcode.register_command('HOME_ZMAX', self.cmd_HOME_ZMAX,
                                desc=self.cmd_HOME_ZMAX_help)
+        gcode.register_command('TEST_ZMAX', self.cmd_TEST_ZMAX, desc=self.cmd_TEST_ZMAX_help)
         # Wrap G28 (melt loads after safe_z_home/homing_override, so this
         # runs in front of them)
         self.printer.load_object(config, 'homing')
@@ -479,6 +480,20 @@ class Melt:
         self.a_offset = self.b_offset = 0.0
         self.z_offset = self.v_offset = 0.0
         self.z_motors_lost = False
+
+    def TEST_ZMAX(self, gcmd):
+        homing_current = gcmd.get_float('CURRENT', Z_MAX_HOMING_CURRENT,
+                                        above=0.)
+        retract_dist = gcmd.get_float('RETRACT', 100., minval=0.)
+        debug = gcmd.get_int('DEBUG', 1, minval=0, maxval=1)
+        max_diff = gcmd.get_float('MAX_DIFF', Z_MAX_MAX_DIFF, above=0.)
+
+
+        gcode = self.printer.lookup_object('gcode')
+        for i in range(5):
+            msg = f"Iteration: {str(i)}"
+            gcode.respond_info(str(msg))
+            self.HOME_ZMAX(homing_current, retract_dist, debug, max_diff)
 
 def load_config(config):
     return Melt(config)
