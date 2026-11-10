@@ -481,7 +481,8 @@ class Melt:
         self.z_offset = self.v_offset = 0.0
         self.z_motors_lost = False
 
-    def TEST_ZMAX(self, gcmd):
+    cmd_HOME_ZMAX_help = "Home each Z stepper to max independently using "
+    def cmd_TEST_ZMAX(self, gcmd):
         homing_current = gcmd.get_float('CURRENT', Z_MAX_HOMING_CURRENT,
                                         above=0.)
         retract_dist = gcmd.get_float('RETRACT', 100., minval=0.)
