@@ -77,7 +77,7 @@ class Melt:
         if not any(gcmd.get(a, None) is not None for a in "XYZ"):
             need_z = True
         if need_z and (self.z_motors_lost or self._offsets_nonzero()):
-            self.home_zmax(Z_MAX_HOMING_CURRENT, Z_MAX_RETRACT_DIST)
+            self.HOME_ZMAX(Z_MAX_HOMING_CURRENT, Z_MAX_RETRACT_DIST)
         self.prev_G28(gcmd)
     def _setup_z_max_endstop(self, config, mcu_stepper):
         # Give each Z stepper its own TMC virtual endstop so that during
@@ -327,8 +327,8 @@ class Melt:
         homing_current = gcmd.get_float('CURRENT', Z_MAX_HOMING_CURRENT,
                                         above=0.)
         retract_dist = gcmd.get_float('RETRACT', Z_MAX_RETRACT_DIST, minval=0.)
-        self.home_zmax(homing_current, retract_dist)
-    def home_zmax(self, homing_current, retract_dist):
+        self.HOME_ZMAX(homing_current, retract_dist)
+    def HOME_ZMAX(self, homing_current, retract_dist):
         if self.z_max_errors:
             raise self.printer.command_error("HOME_ZMAX unavailable: %s"
                                      % ("; ".join(self.z_max_errors),))
