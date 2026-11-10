@@ -485,16 +485,21 @@ class Melt:
     def cmd_TEST_ZMAX(self, gcmd):
         homing_current = gcmd.get_float('CURRENT', Z_MAX_HOMING_CURRENT,
                                         above=0.)
-        retract_dist = gcmd.get_float('RETRACT', 100., minval=0.)
+        retract_dist = gcmd.get_float('RETRACT', 200., minval=0.)
         debug = gcmd.get_int('DEBUG', 1, minval=0, maxval=1)
         max_diff = gcmd.get_float('MAX_DIFF', Z_MAX_MAX_DIFF, above=0.)
 
 
         gcode = self.printer.lookup_object('gcode')
-        for i in range(5):
+        for i in range(100):
             msg = f"Iteration: {str(i)}"
             gcode.respond_info(str(msg))
-            self.HOME_ZMAX(homing_current, retract_dist, debug, max_diff)
+            try:
+                self.HOME_ZMAX(homing_current, retract_dist, debug, max_diff)
+            except self.printer.command_error as e:
+                # Stop the test on the first failed HOME_ZMAX
+                raise self.printer.command_error(
+                    "TEST_ZMAX stopped at iteration %d: %s" % (i, str(e)))
 
 def load_config(config):
     return Melt(config)
