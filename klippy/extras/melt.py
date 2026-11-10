@@ -9,6 +9,78 @@ import chelper
 
 Z_MAX_HOMING_CURRENT = 0.5
 Z_MAX_RETRACT_DIST = 20.
+# HOME_ZMAX DEBUG=1: largest allowed difference (mm) in how far the Z
+# motors travel before stalling. Must exceed the biggest real bed tilt.
+Z_MAX_MAX_DIFF = 5.
+
+# Watches the HOME_ZMAX endstops. Once the first motor stalls, any motor
+# still moving after another max_diff mm of travel is stopped, so a false
+# stall on one motor can't let the others twist the bed against the stops.
+class ZMaxTriggerMonitor:
+    def __init__(self, printer, endstops, max_diff, speed):
+        self.reactor = printer.get_reactor()
+        self.endstops = endstops
+        self.max_diff = max_diff
+        self.max_time = max_diff / speed
+        self.pending = {}
+        self.first = None
+        self.aborted = []
+        self.timer = None
+    def start(self):
+        # Hook home_start() on each endstop instance to get its completion
+        for mcu_endstop, name in self.endstops:
+            self._hook(mcu_endstop, name)
+    def _hook(self, mcu_endstop, name):
+        orig_home_start = mcu_endstop.home_start
+        def home_start(*args, **kwargs):
+            self._unhook(mcu_endstop)
+            completion = orig_home_start(*args, **kwargs)
+            self.pending[name] = mcu_endstop
+            self.reactor.register_callback(
+                lambda e: self._wait_trigger(completion, name))
+            return completion
+        mcu_endstop.home_start = home_start
+    def _unhook(self, mcu_endstop):
+        if 'home_start' in mcu_endstop.__dict__:
+            del mcu_endstop.home_start
+    def stop(self):
+        for mcu_endstop, name in self.endstops:
+            self._unhook(mcu_endstop)
+        if self.timer is not None:
+            self.reactor.unregister_timer(self.timer)
+            self.timer = None
+        self.pending.clear()
+    def _wait_trigger(self, completion, name):
+        completion.wait()
+        if self.pending.pop(name, None) is None:
+            return
+        if self.first is None:
+            self.first = name
+            self.timer = self.reactor.register_timer(
+                self._abort_pending, self.reactor.monotonic() + self.max_time)
+    def _abort_pending(self, eventtime):
+        for name, mcu_endstop in self.pending.items():
+            mcu_endstop.home_abort()
+            self.aborted.append(name)
+        self.pending.clear()
+        return self.reactor.NEVER
+    def get_distances(self, hmove):
+        # Travel (mm) of each stepper until its stall (or abort)
+        dists = {}
+        for sp in hmove.stepper_positions:
+            pos = sp.trig_pos
+            if sp.endstop_name in self.aborted:
+                pos = sp.halt_pos
+            if pos is None:
+                continue
+            dists[sp.stepper_name] = (abs(pos - sp.start_pos)
+                                      * sp.stepper.get_step_dist())
+        return dists
+    def format_distances(self, dists):
+        return "\n".join(
+            "%s: %s after %.2f mm" % (
+                n, "stopped" if n in self.aborted else "stalled", d)
+            for n, d in sorted(dists.items()))
 
 TMC_DRIVERS = ['tmc2209', 'tmc2130', 'tmc2208', 'tmc2240', 'tmc2660',
                'tmc5160']
@@ -322,13 +394,17 @@ class Melt:
                 "SET_TMC_CURRENT STEPPER=%s CURRENT=%.3f" % (name, cur))
 
     cmd_HOME_ZMAX_help = "Home each Z stepper to max independently using " \
-                        "sensorless homing [CURRENT=<amps>] [RETRACT=<mm>]"
+                        "sensorless homing [CURRENT=<amps>] [RETRACT=<mm>] " \
+                        "[DEBUG=0|1] [MAX_DIFF=<mm>]"
     def cmd_HOME_ZMAX(self, gcmd):
         homing_current = gcmd.get_float('CURRENT', Z_MAX_HOMING_CURRENT,
                                         above=0.)
         retract_dist = gcmd.get_float('RETRACT', Z_MAX_RETRACT_DIST, minval=0.)
-        self.HOME_ZMAX(homing_current, retract_dist)
-    def HOME_ZMAX(self, homing_current, retract_dist):
+        debug = gcmd.get_int('DEBUG', 0, minval=0, maxval=1)
+        max_diff = gcmd.get_float('MAX_DIFF', Z_MAX_MAX_DIFF, above=0.)
+        self.HOME_ZMAX(homing_current, retract_dist, debug, max_diff)
+    def HOME_ZMAX(self, homing_current, retract_dist, debug=False,
+                  max_diff=Z_MAX_MAX_DIFF):
         if self.z_max_errors:
             raise self.printer.command_error("HOME_ZMAX unavailable: %s"
                                      % ("; ".join(self.z_max_errors),))
@@ -357,11 +433,39 @@ class Melt:
         # All endstops start together; each one halts only its own stepper
         # and the move ends once every endstop has triggered
         hmove = homing.HomingMove(self.printer, self.z_max_endstops)
+        monitor = None
+        if debug:
+            monitor = ZMaxTriggerMonitor(self.printer, self.z_max_endstops,
+                                         max_diff, speed)
         try:
             try:
+                if monitor is not None:
+                    monitor.start()
                 hmove.homing_move(movepos, speed)
+            except self.printer.command_error:
+                if monitor is None or not monitor.aborted:
+                    raise
+                raise self.printer.command_error(
+                    "HOME_ZMAX stopped: %s stalled more than %.2f mm before"
+                    " %s (false stall?)\n%s" % (
+                        monitor.first, max_diff, ", ".join(monitor.aborted),
+                        monitor.format_distances(
+                            monitor.get_distances(hmove))))
             finally:
+                if monitor is not None:
+                    monitor.stop()
                 self._set_z_currents(prev_currents)
+            if monitor is not None:
+                # Also catches a stall that raced the abort timer
+                dists = monitor.get_distances(hmove)
+                text = monitor.format_distances(dists)
+                if dists and max(dists.values()) - min(dists.values()) \
+                        > max_diff:
+                    raise self.printer.command_error(
+                        "HOME_ZMAX: Z motors stalled more than %.2f mm"
+                        " apart\n%s" % (max_diff, text))
+                gcode = self.printer.lookup_object('gcode')
+                gcode.respond_info("HOME_ZMAX trigger distances:\n" + text)
             # Back off from the top stops at normal current
             if retract_dist:
                 movepos[2] -= retract_dist

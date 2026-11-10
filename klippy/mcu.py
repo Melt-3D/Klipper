@@ -216,6 +216,8 @@ class MCU_trsync:
                                           reqclock=expire_clock)
     def set_home_end_time(self, home_end_time):
         self._home_end_clock = self._mcu.print_time_to_clock(home_end_time)
+    def trigger(self, reason):
+        self._trsync_trigger_cmd.send([self._oid, reason])
     def stop(self):
         self._mcu.register_response(None, "trsync_state", self._oid)
         self._trigger_completion = None
@@ -273,6 +275,10 @@ class TriggerDispatch:
         ffi_main, ffi_lib = chelper.get_ffi()
         ffi_lib.trdispatch_start(self._trdispatch, etrsync.REASON_HOST_REQUEST)
         return self._trigger_completion
+    def abort(self):
+        # Halt the steppers now, as if the endstop had triggered
+        for trsync in self._trsyncs:
+            trsync.trigger(MCU_trsync.REASON_HOST_REQUEST)
     def wait_end(self, end_time):
         etrsync = self._trsyncs[0]
         etrsync.set_home_end_time(end_time)
@@ -335,6 +341,10 @@ class MCU_endstop:
              self._dispatch.get_oid(), MCU_trsync.REASON_ENDSTOP_HIT],
             reqclock=clock)
         return trigger_completion
+    def home_abort(self):
+        # Stop this endstop's steppers mid homing move without a trigger;
+        # home_wait() will then report no trigger for it
+        self._dispatch.abort()
     def home_wait(self, home_end_time):
         self._dispatch.wait_end(home_end_time)
         self._home_cmd.send([self._oid, 0, 0, 0, 0, 0, 0, 0])
