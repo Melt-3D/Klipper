@@ -38,6 +38,11 @@ class MCU_stepper:
                 "Stepper dir pin must be on same mcu as step pin")
         self._dir_pin = dir_pin_params['pin']
         self._invert_dir = self._orig_invert_dir = dir_pin_params['invert']
+        # The mcu counts steps by the physical dir pin. Steps taken while
+        # the dir is inverted at runtime make that count drift from the
+        # host's count by 2 steps per step; track it to correct mcu queries.
+        self._dir_flip_correction = 0
+        self._dir_flip_start = None
         self._step_both_edge = self._req_step_both_edge = False
         self._mcu_position_offset = 0.
         self._reset_cmd_tag = self._get_position_cmd = None
@@ -143,6 +148,15 @@ class MCU_stepper:
         invert_dir = not not invert_dir
         if invert_dir == self._invert_dir:
             return
+        # Caller must have flushed step generation before changing dir
+        cur_pos = 0
+        if self._stepper_kinematics is not None:
+            cur_pos = self.get_mcu_position()
+        if invert_dir != self._orig_invert_dir:
+            self._dir_flip_start = cur_pos
+        elif self._dir_flip_start is not None:
+            self._dir_flip_correction += 2 * (cur_pos - self._dir_flip_start)
+            self._dir_flip_start = None
         self._invert_dir = invert_dir
         ffi_main, ffi_lib = chelper.get_ffi()
         ffi_lib.stepcompress_set_invert_sdir(self._stepqueue, invert_dir)
@@ -212,8 +226,12 @@ class MCU_stepper:
             return
         params = self._get_position_cmd.send([self._oid])
         last_pos = params['pos']
-        if self._invert_dir:
+        if self._orig_invert_dir:
             last_pos = -last_pos
+        last_pos += self._dir_flip_correction
+        if self._dir_flip_start is not None:
+            # Currently inverted: steps since the flip counted backwards
+            last_pos = 2 * self._dir_flip_start - last_pos
         print_time = self._mcu.estimated_print_time(params['#receive_time'])
         clock = self._mcu.print_time_to_clock(print_time)
         ffi_main, ffi_lib = chelper.get_ffi()

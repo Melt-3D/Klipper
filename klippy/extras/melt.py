@@ -13,7 +13,14 @@
 # switches stepper_z1 and stepper_z2 to their own trapq, which gets the
 # combined Z + offset motion of every move ("independent" mode).
 import math, logging
+from . import force_move, homing
 import chelper
+
+Z_MAX_HOMING_CURRENT = 0.5
+Z_MAX_RETRACT_DIST = 20.
+
+TMC_DRIVERS = ['tmc2209', 'tmc2130', 'tmc2208', 'tmc2240', 'tmc2660',
+               'tmc5160']
 
 class ZOffsetAxis:
     def __init__(self, melt, config, gcode_id, stepper_name):
@@ -102,6 +109,11 @@ class Melt:
     def __init__(self, config):
         self.printer = config.get_printer()
         self.steppers = {}
+        # Per-stepper sensorless endstops used by HOME_ZMAX
+        self.z_max_endstops = []
+        self.z_tmc_names = {}
+        self.z_max_errors = []
+        self.z_motors_lost = True
 
         self.a_angle = 0.0
         self.b_angle = 0.0
@@ -130,8 +142,60 @@ class Melt:
         gcode.register_command('G14', self.cmd_G14, desc=self.cmd_G14_help)
         gcode.register_command('GET_ANGLE', self.cmd_GET_ANGLE, desc=self.cmd_GET_ANGLE_help)
         gcode.register_command('G15', self.cmd_G15, desc=self.cmd_G15_help)
+        gcode.register_command('HOME_ZMAX', self.cmd_HOME_ZMAX,
+                               desc=self.cmd_HOME_ZMAX_help)
+        # Wrap G28 (melt loads after safe_z_home/homing_override, so this
+        # runs in front of them)
+        self.printer.load_object(config, 'homing')
+        self.prev_G28 = gcode.register_command('G28', None)
+        gcode.register_command('G28', self.cmd_G28)
     def register_stepper(self, config, mcu_stepper):
-        self.steppers[mcu_stepper.get_name()] = mcu_stepper
+        name = mcu_stepper.get_name()
+        self.steppers[name] = mcu_stepper
+        if name.startswith('stepper_z'):
+            self._setup_z_max_endstop(config, mcu_stepper)
+            # Track when this Z motor is turned off (M84, idle timeout, ...)
+            stepper_enable = self.printer.lookup_object('stepper_enable')
+            stepper_enable.lookup_enable(name).register_state_callback(
+                self._handle_z_enable)
+    def _handle_z_enable(self, print_time, enabled):
+        if not enabled:
+            self.z_motors_lost = True
+    def _offsets_nonzero(self):
+        return (bool(self.a_angle or self.b_angle)
+                or any(abs(o) > 0.000001 for o in self.get_offsets()))
+    def cmd_G28(self, gcmd):
+        # Home Z to max first if Z motors were off or any offset is set
+        need_z = gcmd.get('Z', None) is not None
+        if not any(gcmd.get(a, None) is not None for a in "XYZ"):
+            need_z = True
+        if need_z and (self.z_motors_lost or self._offsets_nonzero()):
+            self.HOME_ZMAX(Z_MAX_HOMING_CURRENT, Z_MAX_RETRACT_DIST)
+        self.prev_G28(gcmd)
+    def _setup_z_max_endstop(self, config, mcu_stepper):
+        # Give each Z stepper its own TMC virtual endstop so that during
+        # HOME_ZMAX every motor stops only on its own stall
+        name = mcu_stepper.get_name()
+        driver = None
+        for d in TMC_DRIVERS:
+            if config.has_section('%s %s' % (d, name)):
+                driver = d
+                break
+        if driver is None:
+            self.z_max_errors.append("%s: no tmc driver section" % (name,))
+            return
+        tmc_config = config.getsection('%s %s' % (driver, name))
+        if not any(tmc_config.get(opt, None) is not None
+                   for opt in ['diag_pin', 'diag0_pin', 'diag1_pin']):
+            self.z_max_errors.append("%s: missing diag_pin in [%s %s]"
+                                     % (name, driver, name))
+            return
+        ppins = self.printer.lookup_object('pins')
+        mcu_endstop = ppins.setup_pin(
+            'endstop', '%s_%s:virtual_endstop' % (driver, name))
+        mcu_endstop.add_stepper(mcu_stepper)
+        self.z_max_endstops.append((mcu_endstop, name))
+        self.z_tmc_names[name] = '%s %s' % (driver, name)
     def lookup_stepper(self, name):
         if name not in self.steppers:
             raise self.printer.config_error("Unknown stepper %s" % (name,))
@@ -176,9 +240,13 @@ class Melt:
                 "Move V and W back to 0 before %s" % (reason,))
         toolhead = self.printer.lookup_object('toolhead')
         toolhead.flush_step_generation()
-        pos = toolhead.get_position()
+        self._enter_synced(toolhead.get_position())
+    def _enter_synced(self, toolhead_pos):
+        # Switch without the offset check (toolhead must be flushed)
+        if not self.independent:
+            return
         for axis in self.axes:
-            axis.enter_synced(pos)
+            axis.enter_synced(toolhead_pos)
         self.independent = False
         logging.info("melt: Z motors switched to synced mode")
     def _handle_set_position(self):
@@ -358,6 +426,76 @@ class Melt:
 
             self.angle_move(30, 0, 20)
             self.angle_move(0, 0, 20)
+
+    def _set_z_currents(self, currents):
+        # currents: {stepper_name: run_current}
+        gcode = self.printer.lookup_object('gcode')
+        for name, cur in currents.items():
+            gcode.run_script_from_command(
+                "SET_TMC_CURRENT STEPPER=%s CURRENT=%.3f" % (name, cur))
+
+    cmd_HOME_ZMAX_help = "Home each Z stepper to max independently using " \
+                        "sensorless homing [CURRENT=<amps>] [RETRACT=<mm>]"
+    def cmd_HOME_ZMAX(self, gcmd):
+        homing_current = gcmd.get_float('CURRENT', Z_MAX_HOMING_CURRENT,
+                                        above=0.)
+        retract_dist = gcmd.get_float('RETRACT', Z_MAX_RETRACT_DIST, minval=0.)
+        self.HOME_ZMAX(homing_current, retract_dist)
+    def HOME_ZMAX(self, homing_current, retract_dist):
+        if self.z_max_errors:
+            raise self.printer.command_error("HOME_ZMAX unavailable: %s"
+                                     % ("; ".join(self.z_max_errors),))
+        if not self.z_max_endstops:
+            raise self.printer.command_error(
+                "HOME_ZMAX unavailable: no Z steppers found")
+        toolhead = self.printer.lookup_object('toolhead')
+        kin = toolhead.get_kinematics()
+        z_rail = kin.rails[2]
+        z_min, z_max = z_rail.get_range()
+        speed = z_rail.get_homing_info().speed
+        retract_dist = min(retract_dist, z_max - z_min)
+        # Reduced run current during the homing move
+        prev_currents = {}
+        for name, tmc_name in self.z_tmc_names.items():
+            tmc = self.printer.lookup_object(tmc_name)
+            prev_currents[name] = tmc.get_status()['run_current']
+        self._set_z_currents({n: homing_current for n in prev_currents})
+        # Pretend Z is at its minimum so a move to max covers full travel
+        toolhead.flush_step_generation()
+        pos = toolhead.get_position()
+        pos[2] = z_min
+        # Motors meet at the top stops, so V/W and the tilt end up at 0.
+        # Sync the Z motors without the offset check, otherwise the
+        # homing_move_begin handler would refuse the move.
+        for axis in self.axes:
+            pos[axis.get_index()] = 0.
+        self._enter_synced(pos)
+        self.a_angle = self.b_angle = 0.0
+        # Until the move completes the bed may still be tilted
+        self.z_motors_lost = True
+        toolhead.set_position(pos, homing_axes="z")
+        movepos = list(pos)
+        movepos[2] = z_max
+        # All endstops start together; each one halts only its own stepper
+        # and the move ends once every endstop has triggered
+        hmove = homing.HomingMove(self.printer, self.z_max_endstops)
+        try:
+            try:
+                hmove.homing_move(movepos, speed)
+            finally:
+                self._set_z_currents(prev_currents)
+            # Back off from the top stops at normal current
+            if retract_dist:
+                movepos[2] -= retract_dist
+                toolhead.move(movepos, speed)
+                toolhead.wait_moves()
+        finally:
+            # Position is not known relative to the bed, require G28 Z
+            kin.clear_homing_state("z")
+            # Pick up the zeroed V/W positions in gcode coordinates
+            self.printer.lookup_object('gcode_move').reset_last_position()
+        # Bed is now flat against the top stops
+        self.z_motors_lost = False
 
 def load_config(config):
     return Melt(config)
