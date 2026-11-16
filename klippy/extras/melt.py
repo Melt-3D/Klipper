@@ -13,7 +13,7 @@
 # switches stepper_z1 and stepper_z2 to their own trapq, which gets the
 # combined Z + offset motion of every move ("independent" mode).
 import math, logging
-from . import force_move, homing
+from . import homing
 import chelper
 
 Z_MAX_HOMING_CURRENT = 0.5
@@ -385,8 +385,6 @@ class Melt:
                     if seen_layer > 1:
                         break
             self.eject_coords["X"] = sum_x / amnt_x
-            # gcode.respond_info(str(self.eject_coords))
-            # raise gcmd.error("STOP")
 
         #  Eject the print
         elif 'E' in params:
