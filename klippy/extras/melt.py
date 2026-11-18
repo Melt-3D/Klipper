@@ -18,6 +18,8 @@ import chelper
 
 Z_MAX_HOMING_CURRENT = 0.5
 Z_MAX_RETRACT_DIST = 20.
+# TESTING: set back to True to refuse probing while V/W are not 0
+PROBE_REQUIRE_ZERO_OFFSETS = False
 
 TMC_DRIVERS = ['tmc2209', 'tmc2130', 'tmc2208', 'tmc2240', 'tmc2660',
                'tmc5160']
@@ -120,6 +122,7 @@ class Melt:
         self.length = config.getfloat('length', 250.95, above=0.)
         self.width = config.getfloat('width', 285.9, above=0.)
         self.eject_coords = {"X": 0.0, "Y": 200.0, "Z": 10.0}
+        self.z_offset = 0.0
 
         # V/W axes
         self.independent = False
@@ -142,6 +145,7 @@ class Melt:
         gcode.register_command('G14', self.cmd_G14, desc=self.cmd_G14_help)
         gcode.register_command('GET_ANGLE', self.cmd_GET_ANGLE, desc=self.cmd_GET_ANGLE_help)
         gcode.register_command('G15', self.cmd_G15, desc=self.cmd_G15_help)
+        gcode.register_command('G16', self.cmd_G16, desc=self.cmd_G16_help)
         gcode.register_command('HOME_ZMAX', self.cmd_HOME_ZMAX,
                                desc=self.cmd_HOME_ZMAX_help)
         # Wrap G28 (melt loads after safe_z_home/homing_override, so this
@@ -265,7 +269,13 @@ class Melt:
         z_steppers = [axis.stepper for axis in self.axes]
         for mcu_endstop in hmove.get_mcu_endstops():
             if any(s in z_steppers for s in mcu_endstop.get_steppers()):
-                self.set_synced("probing")
+                if PROBE_REQUIRE_ZERO_OFFSETS:
+                    self.set_synced("probing")
+                elif self.independent:
+                    # Sync without the offset check; V/W keep their values
+                    toolhead = self.printer.lookup_object('toolhead')
+                    toolhead.flush_step_generation()
+                    self._enter_synced(toolhead.get_position())
                 return
 
     cmd_GET_OFFSET_help = "Get current V and W offset"
@@ -424,6 +434,56 @@ class Melt:
 
             self.angle_move(30, 0, 20)
             self.angle_move(0, 0, 20)
+
+    cmd_G16_help = "Probe the bed at the first print point after the tilt"
+    def cmd_G16(self, gcmd):
+        print_stats = self.printer.lookup_object('print_stats')
+        filename = print_stats.get_status(0)['filename']
+        toolhead = self.printer.lookup_object("toolhead")
+        exp_z_pos = 0.0
+        if filename == "":
+            raise gcmd.error("No file printing currently")
+        filelines = []
+        with open("/home/biqu/printer_data/gcodes/" + filename, "r") as file:
+            filelines = file.read().split("\n")
+        # XY of the first print move after the first bed tilt
+        curpos = None
+        first_tilt_done = False
+        layer_height = 0.0
+        for line in filelines:
+            if not first_tilt_done and line.startswith("G1 ") and " V" in line and " W" in line:
+                first_tilt_done = True
+            elif first_tilt_done and line.startswith(";MELT_HEIGHT:"):
+                layer_height = float(line.split(":")[1])
+            elif first_tilt_done and line.startswith("G1 ") and " X" in line and " Y" in line and " Z" in line:
+                curpos = toolhead.get_position()
+                splitline = line.split()
+                curpos[0] = float(splitline[1][1:])
+                curpos[1] = float(splitline[2][1:])
+                exp_z_pos  = float(splitline[3][1:])
+                break
+        if curpos is None:
+            raise gcmd.error("No print move found after the first bed tilt")
+        toolhead.move(curpos, 120)
+        printer_probe = self.printer.lookup_object('probe')
+        lift_speed = printer_probe.get_probe_params(gcmd)['lift_speed']
+        start_z = curpos[2]
+        probe_session = printer_probe.start_probe_session(gcmd)
+        probe_session.run_probe(gcmd)
+        trig_z = probe_session.pull_probed_results()[0][2]
+        probe_session.end_probe_session()
+        gcmd.respond_info(
+            "Probe travelled %.4f mm (start z=%.4f, trigger z=%.4f)"
+            % (start_z - trig_z, start_z, trig_z))
+        toolhead.manual_move([None, None, start_z], lift_speed)
+        exp_bed_z = exp_z_pos - layer_height
+        bed_z = trig_z - printer_probe.get_offsets()[2]
+        self.z_offset = bed_z - exp_bed_z
+        gcmd.respond_info(
+            "Bed at z=%.4f, expected z=%.4f, gcode Z offset set to %.4f"
+            % (bed_z, exp_bed_z, self.z_offset))
+        gcode = self.printer.lookup_object('gcode')
+        gcode.run_script_from_command("SET_GCODE_OFFSET Z=%.4f MOVE=1" % (self.z_offset,))
 
     def _set_z_currents(self, currents):
         # currents: {stepper_name: run_current}
