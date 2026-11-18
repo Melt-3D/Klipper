@@ -18,7 +18,8 @@ import chelper
 
 Z_MAX_HOMING_CURRENT = 0.5
 Z_MAX_RETRACT_DIST = 20.
-# TESTING: set back to True to refuse probing while V/W are not 0
+# Set to True to refuse probing while V/W are not 0. G16 probes the
+# tilted bed and needs this False.
 PROBE_REQUIRE_ZERO_OFFSETS = False
 
 TMC_DRIVERS = ['tmc2209', 'tmc2130', 'tmc2208', 'tmc2240', 'tmc2660',
@@ -236,6 +237,11 @@ class Melt:
             axis.enter_independent(pos[2] + pos[axis.get_index()], print_time)
         self.independent = True
         logging.info("melt: Z motors switched to independent mode")
+        # The bed starts tilting - apply the Z correction measured by G16.
+        # No MOVE=1 here: this runs in the middle of the tilt move.
+        if self.z_offset:
+            gcode = self.printer.lookup_object('gcode')
+            gcode.run_script_from_command("SET_GCODE_OFFSET Z=%.4f" % (self.z_offset,))
     def set_synced(self, reason):
         if not self.independent:
             return
@@ -435,39 +441,65 @@ class Melt:
             self.angle_move(30, 0, 20)
             self.angle_move(0, 0, 20)
 
-    cmd_G16_help = "Probe the bed at the first print point after the tilt"
+    def _gcode_words(self, line):
+        return {w[0]: float(w[1:]) for w in line.split(";")[0].split()[1:]}
+
+    cmd_G16_help = "Tilt the bed like the print will, probe the first \
+                    print point and store the Z correction for the tilt"
     def cmd_G16(self, gcmd):
         print_stats = self.printer.lookup_object('print_stats')
         filename = print_stats.get_status(0)['filename']
         toolhead = self.printer.lookup_object("toolhead")
+        gcode = self.printer.lookup_object('gcode')
         exp_z_pos = 0.0
         if filename == "":
             raise gcmd.error("No file printing currently")
+        if any(abs(o) > 0.000001 for o in self.get_offsets()):
+            raise gcmd.error("G16 must be started with the bed level")
         filelines = []
         with open("/home/biqu/printer_data/gcodes/" + filename, "r") as file:
             filelines = file.read().split("\n")
-        # XY of the first print move after the first bed tilt
-        curpos = None
+        # First bed tilt, the lift before it and the first print move after
+        first_xy = None
         first_tilt_done = False
+        tilt = None
+        lift_z = None
         layer_height = 0.0
         for line in filelines:
             if not first_tilt_done and line.startswith("G1 ") and " V" in line and " W" in line:
                 first_tilt_done = True
+                tilt = self._gcode_words(line)
+            elif not first_tilt_done and line.startswith("G1 ") and " Z" in line:
+                # Last Z before the tilt: the lift for a safe bed tilt
+                lift_z = self._gcode_words(line).get("Z", lift_z)
             elif first_tilt_done and line.startswith(";MELT_HEIGHT:"):
                 layer_height = float(line.split(":")[1])
             elif first_tilt_done and line.startswith("G1 ") and " X" in line and " Y" in line and " Z" in line:
-                curpos = toolhead.get_position()
                 splitline = line.split()
-                curpos[0] = float(splitline[1][1:])
-                curpos[1] = float(splitline[2][1:])
+                first_xy = [float(splitline[1][1:]), float(splitline[2][1:])]
                 exp_z_pos  = float(splitline[3][1:])
                 break
-        if curpos is None:
+        if first_xy is None:
             raise gcmd.error("No print move found after the first bed tilt")
-        toolhead.move(curpos, 120)
+        if lift_z is None:
+            raise gcmd.error("No Z lift found before the first bed tilt")
+        if self.z_offset:
+            gcode.run_script_from_command("SET_GCODE_OFFSET Z=0")
+        self.z_offset = 0.0
+        v_index, w_index = [axis.get_index() for axis in self.axes]
+        start_pos = toolhead.get_position()
+        pos = list(start_pos)
+        pos[2] = lift_z
+        toolhead.move(pos, self.max_z_velocity)
+        pos[2] = tilt.get("Z", lift_z)
+        pos[v_index] = tilt["V"]
+        pos[w_index] = tilt["W"]
+        toolhead.move(pos, self.max_z_velocity)
+        pos[0], pos[1] = first_xy
+        toolhead.move(pos, 120)
         printer_probe = self.printer.lookup_object('probe')
         lift_speed = printer_probe.get_probe_params(gcmd)['lift_speed']
-        start_z = curpos[2]
+        start_z = pos[2]
         probe_session = printer_probe.start_probe_session(gcmd)
         probe_session.run_probe(gcmd)
         trig_z = probe_session.pull_probed_results()[0][2]
@@ -475,15 +507,28 @@ class Melt:
         gcmd.respond_info(
             "Probe travelled %.4f mm (start z=%.4f, trigger z=%.4f)"
             % (start_z - trig_z, start_z, trig_z))
+        # Back up, level the bed again and return to where G16 started
         toolhead.manual_move([None, None, start_z], lift_speed)
+        pos = toolhead.get_position()
+        pos[2] = lift_z
+        pos[v_index] = start_pos[v_index]
+        pos[w_index] = start_pos[w_index]
+        toolhead.move(pos, self.max_z_velocity)
+        toolhead.move(start_pos, 120)
+        # Z motors synced again, so the tilt of the print applies the
+        # correction (see set_independent)
+        self.set_synced("G16")
+        self.printer.lookup_object('gcode_move').reset_last_position()
+        # The file Z is the nozzle height for the first layer: one layer
+        # height above the bed surface
         exp_bed_z = exp_z_pos - layer_height
+        # The probe triggers z_offset above the bed surface
         bed_z = trig_z - printer_probe.get_offsets()[2]
         self.z_offset = bed_z - exp_bed_z
         gcmd.respond_info(
-            "Bed at z=%.4f, expected z=%.4f, gcode Z offset set to %.4f"
+            "Bed at z=%.4f, expected z=%.4f, Z correction %.4f"
+            " (applied when the bed tilts)"
             % (bed_z, exp_bed_z, self.z_offset))
-        gcode = self.printer.lookup_object('gcode')
-        gcode.run_script_from_command("SET_GCODE_OFFSET Z=%.4f MOVE=1" % (self.z_offset,))
 
     def _set_z_currents(self, currents):
         # currents: {stepper_name: run_current}
